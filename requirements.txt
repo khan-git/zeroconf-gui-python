@@ -1,0 +1,10 @@
+altgraph==0.17.4
+async-timeout==4.0.3
+ifaddr==0.2.0
+packaging==23.2
+pyinstaller==6.3.0
+pyinstaller-hooks-contrib==2024.0
+PyQt6==6.6.1
+PyQt6-Qt6==6.6.1
+PyQt6-sip==13.6.0
+zeroconf==0.131.0
