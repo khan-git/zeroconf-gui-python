@@ -179,6 +179,9 @@ class ZeroConfGui(QMainWindow):
     REMOVE_SERVICE = pyqtSignal(str, str)
     ADD_SERVICE = pyqtSignal(str, str, ServiceInfo)
 
+    masterlock = QSemaphore(1)
+    locks = {}
+
     def __init__(self):
         super().__init__()
         self._zeroconf = None
@@ -193,7 +196,8 @@ class ZeroConfGui(QMainWindow):
 
         self._settings = QSettings("ZeroConfGui", "ZeroConfGui")
         print(f'Settings file: {self._settings.fileName()}')
-        self._services_expanded: [] = json.loads(self._settings.value('services_expanded', '[]'))
+        self._services_expanded: list = json.loads(self._settings.value('services_expanded', '[]'))
+        self._servers_expanded: list = json.loads(self._settings.value('servers_expanded', '[]'))
 
         # self._types: list = json.loads(self._settings.value('types', defaultValue='["_soap._tcp.local.", "_zmp._tcp.local."]'))
         self._types: set[str] = set(json.loads(self._settings.value('types', defaultValue='[]')))
@@ -252,8 +256,14 @@ class ZeroConfGui(QMainWindow):
         quitAction.setShortcut("Ctrl+Q")
         quitAction.setStatusTip('Exit application')
         quitAction.triggered.connect(self.close)
-
         file_menu.addAction(quitAction)
+
+        refreshAction = QAction("&Refrsh", self)
+        refreshAction.setShortcut("Ctrl+R")
+        refreshAction.setStatusTip('Refresh view')
+        refreshAction.triggered.connect(self.refresh_view)
+        file_menu.addAction(refreshAction)
+
 
         settings_menu = mainMenu.addMenu('&Settings')
 
@@ -266,6 +276,9 @@ class ZeroConfGui(QMainWindow):
         filter_types_action.setStatusTip('Filter service type')
         filter_types_action.triggered.connect(self.filter_types)
         settings_menu.addAction(filter_types_action)
+
+    def refresh_view(self) -> None:
+        self.start_listening(list(self._types_filtered))
 
     def hook(self, event: ZeroconfListener.Event, name: str, type_: str, info: ServiceInfo = None) -> None:
         match event:
@@ -280,23 +293,50 @@ class ZeroConfGui(QMainWindow):
     
     @pyqtSlot(str, str, ServiceInfo)
     def update_service(self, name: str, type_: str, info: ServiceInfo):
-        items: list[QStandardItem] = self.service_tree_model.findItems(name)
-        if len(items) > 1:
-            QMessageBox.warning(self, "Warning", f"Multiple items found of {name}")
-        if len(items) == 0:
-            print(f"UPDATE: Item not found {name}")
+        server_items: list[QStandardItem] = self.service_tree_model.findItems(info.server)
+        if len(server_items) == 0:
+            print(f"UPDATE: Server not found {info.server} {name}")
             return
-        item: QStandardItem = items[0]
+        
+        server_item: QStandardItem = server_items[0]
+        item: QStandardItem = self.find_child(server_item, name)
+
+        if item is None:
+            print(f"UPDATE: Item not found {info.server} {name}")
+            return
+        
+        index: QModelIndex = self.service_tree_model.indexFromItem(item)
         if item.hasChildren():
-            kid: int
-            for kid in range(item.rowCount()):
-                self.service_tree_model.removeRow(kid, self.service_tree_model.indexFromItem(item))
-        sibling: QStandardItem = self.service_tree_model.itemFromIndex(self.service_tree_model.sibling(item.row(), 0, self.service_tree_model.indexFromItem(item)))
+            while item.rowCount() > 0:
+                self.service_tree_model.removeRow(0, index)
+        sibling: QStandardItem = self.service_tree_model.itemFromIndex(self.service_tree_model.sibling(item.row(), 1, index))
         sibling.setText(f'{info.server}:{str(info.port)}')
+
+        if len(info._ipv4_addresses):
+            ip4_item = QStandardItem("IPv4")
+            if len(info._ipv4_addresses) == 1:
+                item.appendRow([ip4_item, QStandardItem(str(info._ipv4_addresses[0]))])
+            else:
+                item.appendRow([ip4_item])
+                addr4: IPv4Address
+                for addr4 in info._ipv4_addresses:
+                    ip4_item.appendRow(QStandardItem(str(addr4)))
+        if len(info._ipv6_addresses):
+            ip6_item = QStandardItem("IPv6")
+            if len(info._ipv6_addresses) == 1:
+                item.appendRow([ip6_item, QStandardItem(str(info._ipv6_addresses[0]))])
+            else:
+                item.appendRow([ip6_item])
+                addr6: IPv6Address
+                for addr6 in info._ipv6_addresses:
+                    ip6_item.appendRow(QStandardItem(str(addr6)))
+
         for key, value in info.decoded_properties.items():
             if key == '' or value is None:
                 continue
             item.appendRow([QStandardItem(key), QStandardItem(value)])
+        if info.server in self._servers_expanded:
+            self.service_tree.expand(self.service_tree_model.indexFromItem(server_item))
         if name in self._services_expanded:
             self.service_tree.expand(self.service_tree_model.indexFromItem(item))
         self.items_changed()
@@ -304,27 +344,72 @@ class ZeroConfGui(QMainWindow):
 
     @pyqtSlot(str, str)
     def remove_service(self, name: str, type_: str):
-        items: list[QStandardItem] = self.service_tree_model.findItems(name)
-        item: QStandardItem
-        for item in items:
+        for server_item_row in range(self.service_tree_model.rowCount()):
+            server_item: QStandardItem = self.service_tree_model.item(server_item_row, 0)
+            item: QStandardItem = self.find_child(server_item, name)
+            if item is None:
+                continue
+
             if item.hasChildren():
-                kid: int
-                for kid in range(item.rowCount()):
-                    self.service_tree_model.removeRow(kid, self.service_tree_model.indexFromItem(item))
+                index: QModelIndex = self.service_tree_model.indexFromItem(item)
+                while item.rowCount() > 0:
+                    self.service_tree_model.removeRow(0, index)
+            self.service_tree_model.removeRow(item.row(), index.parent())
+            if not server_item.hasChildren():
+                self.service_tree_model.removeRow(server_item.row())
+            return
 
-
+    def find_child(self, parent: QStandardItem, name: str) -> QStandardItem:
+        if parent.hasChildren():
+            for row in range(parent.rowCount()):
+                child: QStandardItem = parent.child(row, 0)
+                if child.text() == name:
+                    return child
+        return None
+    
     @pyqtSlot(str, str, ServiceInfo)
     def add_service(self, name: str, type_: str, info: ServiceInfo):
+        self.masterlock.acquire()
+        if name not in self.locks:
+            self.locks[name] = QSemaphore(1)
+        self.locks[name].acquire()
+        self.masterlock.release()
+
+        server_item_list: list[QStandardItem] = self.service_tree_model.findItems(info.server)
+        server_item: QStandardItem = None
+        if len(server_item_list) == 0:
+            server_item = QStandardItem(info.server)
+            self.service_tree_model.invisibleRootItem().appendRow([server_item, QStandardItem("")])
+        else:
+            server_item = server_item_list[0]
+
+        item: QStandardItem = self.find_child(server_item, name)
+        if item is not None:
+            self.locks[name].release()
+            self.update_service(name, type, info)
+            return
+        
         item = QStandardItem(name)
-        self.service_tree_model.invisibleRootItem().appendRow([item,QStandardItem(f'{info.server}:{str(info.port)}')])
+        server_item.appendRow([item,QStandardItem(f'{info.server}:{str(info.port)}')])
+
         if len(info._ipv4_addresses):
-            addr4: IPv4Address
-            for addr4 in info._ipv4_addresses:
-                item.appendRow([QStandardItem("IPv4"), QStandardItem(str(addr4))])
+            ip4_item = QStandardItem("IPv4")
+            if len(info._ipv4_addresses) == 1:
+                item.appendRow([ip4_item, QStandardItem(str(info._ipv4_addresses[0]))])
+            else:
+                item.appendRow([ip4_item])
+                addr4: IPv4Address
+                for addr4 in info._ipv4_addresses:
+                    ip4_item.appendRow(QStandardItem(str(addr4)))
         if len(info._ipv6_addresses):
-            addr6: IPv6Address
-            for addr6 in info._ipv6_addresses:
-                item.appendRow([QStandardItem("IPv6"), QStandardItem(str(addr6))])
+            ip6_item = QStandardItem("IPv6")
+            if len(info._ipv6_addresses) == 1:
+                item.appendRow([ip6_item, QStandardItem(str(info._ipv6_addresses[0]))])
+            else:
+                item.appendRow([ip6_item])
+                addr6: IPv6Address
+                for addr6 in info._ipv6_addresses:
+                    ip6_item.appendRow(QStandardItem(str(addr6)))
 
         key: bytes
         value: bytes
@@ -332,9 +417,13 @@ class ZeroConfGui(QMainWindow):
             if key == '' or value is None:
                 continue
             item.appendRow([QStandardItem(key), QStandardItem(value)])
+        if info.server in self._servers_expanded:
+            self.service_tree.expand(self.service_tree_model.indexFromItem(server_item))
         if name in self._services_expanded:
             self.service_tree.expand(self.service_tree_model.indexFromItem(item))
         self.items_changed()
+        self.locks[name].release()
+
 
     @pyqtSlot()
     def add_type(self) -> None:
@@ -399,13 +488,18 @@ class ZeroConfGui(QMainWindow):
         return box
 
     def items_changed(self, index: int = 0) -> None:
-        num_expanded = 0
-        for c in range(self.service_tree_model.rowCount()):
-            row_index: QModelIndex = self.service_tree_model.index(c, 0)
-            num_expanded += 1
-            sz_row = self.service_tree.sizeHintForRow(c)
+        num_expanded = 1
+        for server_row in range(self.service_tree_model.rowCount()):
+            row_index: QModelIndex = self.service_tree_model.index(server_row, 0)
+            sz_row = self.service_tree.sizeHintForRow(server_row)
             if self.service_tree.isExpanded(row_index):
                 num_expanded += self.service_tree_model.itemFromIndex(row_index).rowCount()
+                server_item: QStandardItem = self.service_tree_model.itemFromIndex(row_index)
+                for service_row in range(server_item.rowCount()):
+                    service_index: QModelIndex = self.service_tree_model.index(service_row, 0, row_index)
+                    if self.service_tree.isExpanded(service_index):
+                        num_expanded += self.service_tree_model.itemFromIndex(service_index).rowCount()
+
         for c in range(0, self.service_tree_model.columnCount()):
             self.service_tree.resizeColumnToContents(c)
 
@@ -418,12 +512,18 @@ class ZeroConfGui(QMainWindow):
         self.save_tree_expand()
 
     def save_tree_expand(self) -> None:
+        self._servers_expanded = []
         self._services_expanded = []
         root: QStandardItem = self.service_tree_model.invisibleRootItem()
         for row in range(root.rowCount()):
-            item: QStandardItem = root.child(row, column=0)
-            if self.service_tree.isExpanded(self.service_tree_model.indexFromItem(item)):
-                self._services_expanded.append(item.text())
+            server_item: QStandardItem = root.child(row, column=0)
+            if self.service_tree.isExpanded(self.service_tree_model.indexFromItem(server_item)):
+                self._servers_expanded.append(server_item.text())
+            for kid_row in range(server_item.rowCount()):
+                item: QStandardItem = root.child(kid_row, column=0)
+                if self.service_tree.isExpanded(self.service_tree_model.indexFromItem(item)):
+                    self._services_expanded.append(item.text())
+        self._settings.setValue('servers_expanded', json.dumps(list(set(self._servers_expanded))))
         self._settings.setValue('services_expanded', json.dumps(list(set(self._services_expanded))))
 
 if __name__ == "__main__":
