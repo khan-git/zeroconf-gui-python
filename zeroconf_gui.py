@@ -97,15 +97,24 @@ class ListServices(QDialog):
         line.setFrameShape(QFrame.Shape.HLine)
         line.setFrameShadow(QFrame.Shadow.Sunken)
         self.box_layout.addWidget(line)
+        self.grid_layout = QGridLayout()
+        self.box_layout.addLayout(self.grid_layout)
         self.layout.addWidget(self.group_box)
+        col = 0
+        row = 0
         for type in sorted(types):
             gCB = QCheckBox(type)
             gCB.setTristate(True)
             self.types_boxes.append(gCB)
-            self.box_layout.addWidget(gCB)
+            self.grid_layout.addWidget(gCB, row, col)
             gCB.setCheckState(Qt.CheckState.PartiallyChecked)
             if type in types_filtered:
                 gCB.setChecked(True)
+            row += 1
+            if row > 20:
+                row = 0
+                col += 1
+
 
         QBtn = QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         self.buttonBox = QDialogButtonBox(QBtn)
@@ -503,7 +512,7 @@ class ZeroConfGui(QMainWindow):
         for c in range(0, self.service_tree_model.columnCount()):
             self.service_tree.resizeColumnToContents(c)
 
-        self.resize(self.service_tree.sizeHint().width(), 176 + sz_row * num_expanded)
+        # self.resize(self.service_tree.sizeHint().width(), 176 + sz_row * num_expanded)
         self.service_tree.sortByColumn(0, Qt.SortOrder.AscendingOrder)
 
     @pyqtSlot()
